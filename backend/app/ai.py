@@ -1,11 +1,11 @@
-from openai import OpenAI
+from groq import Groq
 from app.config import settings
 from typing import List, Dict
 import logging
 
 logger = logging.getLogger(__name__)
 
-client = OpenAI(api_key=settings.openai_api_key)
+client = Groq(api_key=settings.groq_api_key)
 
 
 async def generate_email_summary(email_body: str, subject: str, sender: str) -> str:
@@ -20,7 +20,7 @@ Body: {email_body[:1000]}
 Summary:"""
         
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that summarizes emails concisely."},
                 {"role": "user", "content": prompt}
@@ -31,7 +31,11 @@ Summary:"""
         
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"Error generating email summary: {str(e)}")
+        error_msg = str(e)
+        logger.error(f"Error generating email summary: {error_msg}")
+        # If model is decommissioned, suggest alternative
+        if "decommissioned" in error_msg.lower() or "model" in error_msg.lower():
+            logger.warning("Model may be unavailable. Consider updating to llama-3.1-8b-instant or mixtral-8x7b-32768")
         return f"Summary unavailable. Subject: {subject}"
 
 
@@ -58,7 +62,7 @@ Body: {body[:1500]}
 Generate a professional reply:"""
         
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You are a professional email assistant that writes clear, contextually appropriate email replies."},
                 {"role": "user", "content": prompt}
@@ -85,7 +89,7 @@ Command: "{command}"
 Return only valid JSON:"""
         
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You are a command parser. Return only valid JSON."},
                 {"role": "user", "content": prompt}
@@ -122,7 +126,7 @@ Generate a concise daily digest with:
 Digest:"""
         
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that creates email digests."},
                 {"role": "user", "content": prompt}
@@ -154,7 +158,7 @@ Emails:
 Return only valid JSON:"""
         
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that categorizes emails. Return only valid JSON."},
                 {"role": "user", "content": prompt}

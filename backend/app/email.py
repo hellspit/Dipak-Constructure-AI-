@@ -1,26 +1,39 @@
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Header
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from sqlalchemy.orm import Session
 from typing import List, Dict, Optional
+from pydantic import BaseModel
 import base64
 import re
 from email.utils import parseaddr
 import logging
 
 from app.auth import get_credentials
-from app.models import get_db
 from app.ai import generate_email_summary, generate_email_reply
+
+
+class GenerateRepliesRequest(BaseModel):
+    email_ids: List[str]
+
+
+class SendReplyRequest(BaseModel):
+    email_id: str
+    reply_text: str
+
+
+class SearchEmailsRequest(BaseModel):
+    query: str
+    max_results: int = 5
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/email", tags=["email"])
 
 
-def get_gmail_service(session_id: str, db: Session):
+def get_gmail_service(session_id: str):
     """Get Gmail service for a session"""
-    credentials = get_credentials(session_id, db)
+    credentials = get_credentials(session_id)
     if not credentials:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
     
@@ -64,12 +77,11 @@ def get_header(headers: List[Dict], name: str) -> str:
 @router.get("/list")
 async def list_emails(
     max_results: int = 5,
-    session_id: str = Header(..., alias="X-Session-Id"),
-    db: Session = Depends(get_db)
+    session_id: str = Header(..., alias="X-Session-Id")
 ):
     """Get list of recent emails with AI summaries"""
     try:
-        service = get_gmail_service(session_id, db)
+        service = get_gmail_service(session_id)
         
         # Get message list
         results = service.users().messages().list(
@@ -127,6 +139,8 @@ async def list_emails(
         
         return {"emails": emails}
         
+    except HTTPException:
+        raise
     except HttpError as e:
         logger.error(f"Gmail API error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Gmail API error: {str(e)}")
@@ -137,16 +151,15 @@ async def list_emails(
 
 @router.post("/reply/generate")
 async def generate_replies(
-    email_ids: List[str],
-    session_id: str = Header(..., alias="X-Session-Id"),
-    db: Session = Depends(get_db)
+    request: GenerateRepliesRequest,
+    session_id: str = Header(..., alias="X-Session-Id")
 ):
     """Generate AI replies for specified emails"""
     try:
-        service = get_gmail_service(session_id, db)
+        service = get_gmail_service(session_id)
         replies = []
         
-        for email_id in email_ids:
+        for email_id in request.email_ids:
             try:
                 message = service.users().messages().get(
                     userId='me',
@@ -192,19 +205,17 @@ async def generate_replies(
 
 @router.post("/reply/send")
 async def send_reply(
-    email_id: str,
-    reply_text: str,
-    session_id: str = Header(..., alias="X-Session-Id"),
-    db: Session = Depends(get_db)
+    request: SendReplyRequest,
+    session_id: str = Header(..., alias="X-Session-Id")
 ):
     """Send a reply email"""
     try:
-        service = get_gmail_service(session_id, db)
+        service = get_gmail_service(session_id)
         
         # Get original message to reply to
         message = service.users().messages().get(
             userId='me',
-            id=email_id,
+            id=request.email_id,
             format='metadata',
             metadataHeaders=['From', 'To', 'Subject']
         ).execute()
@@ -212,6 +223,7 @@ async def send_reply(
         headers = message['payload'].get('headers', [])
         original_from = get_header(headers, 'From')
         original_subject = get_header(headers, 'Subject')
+        thread_id = message.get('threadId')
         
         # Create reply message
         to_email = parseaddr(original_from)[1]
@@ -221,16 +233,16 @@ async def send_reply(
         message_body += f"Subject: {subject}\r\n"
         message_body += "Content-Type: text/plain; charset=utf-8\r\n"
         message_body += "\r\n"
-        message_body += reply_text
+        message_body += request.reply_text
         
-        message = {
+        email_message = {
             'raw': base64.urlsafe_b64encode(message_body.encode('utf-8')).decode('utf-8'),
-            'threadId': message.get('threadId')
+            'threadId': thread_id
         }
         
         sent_message = service.users().messages().send(
             userId='me',
-            body=message
+            body=email_message
         ).execute()
         
         return {
@@ -250,12 +262,11 @@ async def send_reply(
 @router.delete("/delete/{email_id}")
 async def delete_email(
     email_id: str,
-    session_id: str = Header(..., alias="X-Session-Id"),
-    db: Session = Depends(get_db)
+    session_id: str = Header(..., alias="X-Session-Id")
 ):
     """Delete an email"""
     try:
-        service = get_gmail_service(session_id, db)
+        service = get_gmail_service(session_id)
         
         service.users().messages().delete(
             userId='me',
@@ -268,8 +279,17 @@ async def delete_email(
         }
         
     except HttpError as e:
-        logger.error(f"Gmail API error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete email: {str(e)}")
+        error_details = str(e)
+        logger.error(f"Gmail API error: {error_details}")
+        
+        # Check if it's a scope/permission issue
+        if "insufficient" in error_details.lower() or "permission" in error_details.lower():
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient permissions. Please sign out and sign in again to grant email deletion permissions."
+            )
+        
+        raise HTTPException(status_code=500, detail=f"Failed to delete email: {error_details}")
     except Exception as e:
         logger.error(f"Error deleting email: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
@@ -277,19 +297,17 @@ async def delete_email(
 
 @router.post("/search")
 async def search_emails(
-    query: str,
-    max_results: int = 5,
-    session_id: str = Header(..., alias="X-Session-Id"),
-    db: Session = Depends(get_db)
+    request: SearchEmailsRequest,
+    session_id: str = Header(..., alias="X-Session-Id")
 ):
     """Search emails by query (sender, subject, etc.)"""
     try:
-        service = get_gmail_service(session_id, db)
+        service = get_gmail_service(session_id)
         
         results = service.users().messages().list(
             userId='me',
-            q=query,
-            maxResults=max_results
+            q=request.query,
+            maxResults=request.max_results
         ).execute()
         
         messages = results.get('messages', [])
@@ -298,7 +316,7 @@ async def search_emails(
             return {"emails": []}
         
         emails = []
-        for msg in messages[:max_results]:
+        for msg in messages[:request.max_results]:
             try:
                 message = service.users().messages().get(
                     userId='me',

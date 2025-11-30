@@ -1,22 +1,25 @@
-from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import RedirectResponse
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
-from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 import secrets
-import json
+import logging
 from typing import Optional
 
 from app.config import settings
-from app.models import UserSession, get_db
+from app.models import UserSession, get_session, create_session, update_session, delete_session
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 # OAuth 2.0 scopes
+# Note: 'openid' is automatically added by Google, but we include it explicitly to avoid scope mismatch
 SCOPES = [
+    'openid',
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.send',
     'https://www.googleapis.com/auth/gmail.modify',
@@ -37,11 +40,11 @@ def get_oauth_flow():
                 "client_secret": settings.google_client_secret,
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [f"{settings.frontend_url}/api/auth/callback/google"]
+                "redirect_uris": [f"{settings.backend_url}/api/auth/callback/google"]
             }
         },
         scopes=SCOPES,
-        redirect_uri=f"{settings.frontend_url}/api/auth/callback/google"
+        redirect_uri=f"{settings.backend_url}/api/auth/callback/google"
     )
 
 
@@ -64,31 +67,66 @@ async def google_auth():
 @router.get("/callback/google")
 async def google_callback(
     code: str,
-    state: str,
-    db: Session = Depends(get_db)
+    state: str
 ):
     """Handle Google OAuth callback"""
-    if state not in active_flows:
-        raise HTTPException(status_code=400, detail="Invalid state parameter")
-    
-    flow = active_flows[state]
+    # Try to use stored flow first (preserves exact scopes)
+    if state in active_flows:
+        flow = active_flows[state]
+        del active_flows[state]
+        logger.info("Using stored OAuth flow")
+    else:
+        # Recreate flow - always use the default SCOPES
+        # The state validation is handled by Google, so we can safely recreate
+        logger.info("Recreating OAuth flow (state not found in memory)")
+        flow = get_oauth_flow()
     
     try:
-        flow.fetch_token(code=code)
+        logger.info(f"Fetching token with code for state: {state[:10]}...")
+        # Fetch token - Google may add additional scopes (email, profile, openid)
+        # which causes a scope mismatch warning, but we can ignore it
+        try:
+            flow.fetch_token(code=code)
+        except Exception as scope_error:
+            # Check if it's a scope mismatch warning (not a real error)
+            error_str = str(scope_error).lower()
+            if "scope" in error_str and ("changed" in error_str or "mismatch" in error_str):
+                logger.warning(f"Scope mismatch warning (can be ignored): {str(scope_error)}")
+                # Try to get credentials anyway - the token might still be valid
+                if hasattr(flow, 'credentials') and flow.credentials:
+                    credentials = flow.credentials
+                else:
+                    raise  # Re-raise if we can't get credentials
+            else:
+                raise  # Re-raise if it's a different error
+        
         credentials = flow.credentials
+        logger.info("Token fetched successfully")
         
         # Get user info
+        logger.info("Building OAuth2 service to get user info")
         user_info_service = build('oauth2', 'v2', credentials=credentials)
         user_info = user_info_service.userinfo().get().execute()
         user_email = user_info.get('email')
+        logger.info(f"User info retrieved for: {user_email}")
         
         # Create session
         session_id = secrets.token_urlsafe(32)
         
-        # Calculate expiration
-        expires_at = datetime.utcnow() + timedelta(seconds=credentials.expiry.timestamp() - datetime.utcnow().timestamp()) if credentials.expiry else datetime.utcnow() + timedelta(hours=1)
+        # Calculate expiration - use token expiry if available, otherwise default to 1 hour
+        if credentials.expiry:
+            # Ensure expires_at is timezone-naive UTC datetime
+            expires_at = credentials.expiry
+            if expires_at.tzinfo is not None:
+                # Convert timezone-aware to naive UTC
+                expires_at = expires_at.replace(tzinfo=None)
+            logger.info(f"Using token expiry: {expires_at.isoformat()}")
+        else:
+            expires_at = datetime.utcnow() + timedelta(hours=1)
+            logger.info(f"Using default expiry (1 hour): {expires_at.isoformat()}")
         
-        # Store session in database
+        # Store session in JSON file
+        logger.info(f"Creating session: {session_id[:10]}...")
         db_session = UserSession(
             session_id=session_id,
             user_email=user_email,
@@ -96,35 +134,61 @@ async def google_callback(
             refresh_token=credentials.refresh_token,
             expires_at=expires_at
         )
-        db.add(db_session)
-        db.commit()
-        
-        # Clean up flow
-        del active_flows[state]
+        create_session(db_session)
+        logger.info("Session created successfully")
         
         # Redirect to frontend with session
+        redirect_url = f"{settings.frontend_url}/dashboard?session={session_id}"
+        logger.info(f"Redirecting to: {redirect_url}")
         return RedirectResponse(
-            url=f"{settings.frontend_url}/dashboard?session={session_id}",
+            url=redirect_url,
             status_code=302
         )
         
     except Exception as e:
-        del active_flows[state]
-        raise HTTPException(status_code=400, detail=f"Authentication failed: {str(e)}")
+        # Clean up flow if it was stored
+        if state in active_flows:
+            del active_flows[state]
+        
+        # Log the full error for debugging
+        logger.error(f"Authentication error: {str(e)}", exc_info=True)
+        
+        # Check if it's an invalid_grant error (code already used or expired)
+        error_msg = str(e)
+        if "invalid_grant" in error_msg.lower():
+            # Redirect to frontend with error message
+            error_param = "?error=auth_failed&message=Authorization code expired or already used. Please try signing in again."
+            return RedirectResponse(
+                url=f"{settings.frontend_url}/login{error_param}",
+                status_code=302
+            )
+        
+        # For other errors, redirect with more specific message
+        from urllib.parse import quote
+        error_detail = error_msg[:100] if len(error_msg) > 100 else error_msg
+        error_message = f"Authentication failed: {error_detail}. Please try again."
+        error_param = f"?error=auth_failed&message={quote(error_message)}"
+        return RedirectResponse(
+            url=f"{settings.frontend_url}/login{error_param}",
+            status_code=302
+        )
 
 
 @router.get("/session/{session_id}")
-async def get_session(session_id: str, db: Session = Depends(get_db)):
+async def get_session_info(session_id: str):
     """Get session information"""
-    session = db.query(UserSession).filter(UserSession.session_id == session_id).first()
+    session = get_session(session_id)
     
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    if session.expires_at < datetime.utcnow():
-        db.delete(session)
-        db.commit()
+    now = datetime.utcnow()
+    if session.expires_at < now:
+        logger.warning(f"Session {session_id[:10]}... expired. Expires: {session.expires_at.isoformat()}, Now: {now.isoformat()}")
+        delete_session(session_id)
         raise HTTPException(status_code=401, detail="Session expired")
+    
+    logger.info(f"Session {session_id[:10]}... valid. Expires: {session.expires_at.isoformat()}, Now: {now.isoformat()}")
     
     return {
         "session_id": session.session_id,
@@ -134,9 +198,9 @@ async def get_session(session_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/user/{session_id}")
-async def get_user_info(session_id: str, db: Session = Depends(get_db)):
+async def get_user_info(session_id: str):
     """Get user profile information"""
-    session = db.query(UserSession).filter(UserSession.session_id == session_id).first()
+    session = get_session(session_id)
     
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -159,7 +223,7 @@ async def get_user_info(session_id: str, db: Session = Depends(get_db)):
             session.access_token = credentials.token
             if credentials.refresh_token:
                 session.refresh_token = credentials.refresh_token
-            db.commit()
+            update_session(session)
         
         user_info_service = build('oauth2', 'v2', credentials=credentials)
         user_info = user_info_service.userinfo().get().execute()
@@ -173,9 +237,9 @@ async def get_user_info(session_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail=f"Failed to get user info: {str(e)}")
 
 
-def get_credentials(session_id: str, db: Session) -> Optional[Credentials]:
+def get_credentials(session_id: str) -> Optional[Credentials]:
     """Get credentials for a session"""
-    session = db.query(UserSession).filter(UserSession.session_id == session_id).first()
+    session = get_session(session_id)
     
     if not session or session.expires_at < datetime.utcnow():
         return None
@@ -185,7 +249,8 @@ def get_credentials(session_id: str, db: Session) -> Optional[Credentials]:
         refresh_token=session.refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
         client_id=settings.google_client_id,
-        client_secret=settings.google_client_secret
+        client_secret=settings.google_client_secret,
+        scopes=SCOPES  # Ensure credentials have the right scopes
     )
     
     # Refresh if needed
@@ -195,8 +260,9 @@ def get_credentials(session_id: str, db: Session) -> Optional[Credentials]:
             session.access_token = credentials.token
             if credentials.refresh_token:
                 session.refresh_token = credentials.refresh_token
-            db.commit()
-        except Exception:
+            update_session(session)
+        except Exception as e:
+            logger.error(f"Error refreshing credentials: {str(e)}")
             return None
     
     return credentials

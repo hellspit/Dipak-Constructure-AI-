@@ -6,6 +6,7 @@ import logging
 from app.config import settings
 from app.auth import router as auth_router
 from app.email import router as email_router
+from app.chatbot import router as chatbot_router
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -18,9 +19,20 @@ app = FastAPI(
 )
 
 # CORS middleware
+# Build allowed origins list
+allowed_origins = [
+    settings.frontend_url,
+    "http://localhost:3000",
+    "http://localhost:3001",  # Alternative dev port
+]
+
+# Add production frontend URL if different from dev
+if settings.frontend_url not in allowed_origins:
+    allowed_origins.append(settings.frontend_url)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url, "http://localhost:3000", "https://*.vercel.app"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,6 +41,7 @@ app.add_middleware(
 # Include routers
 app.include_router(auth_router)
 app.include_router(email_router)
+app.include_router(chatbot_router)
 
 
 @app.get("/")
